@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+set -e
+
+if [[ "$1" == "--help" || "$1" == "-h" ]]; then
+  echo "openf - fuzzy open files/folders with default app"
+  exit 0
+fi
+
+sel=$(ls -A | fzf)
+
+[ -n "$sel" ] && open "$sel"
