@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+VERBOSE=0
+
+if [[ "${1:-}" == "--verbose" ]]; then
+    VERBOSE=1
+fi
+
+PATTERNS=(
+    node_modules
+    venv
+    .venv
+    __pycache__
+    .pytest_cache
+    .mypy_cache
+    .ruff_cache
+    .tox
+    .nox
+
+    .next
+    .nuxt
+    .svelte-kit
+    .turbo
+    .parcel-cache
+    .cache
+    .eslintcache
+    coverage
+    dist
+    build
+    out
+
+    Pods
+    .gradle
+    .dart_tool
+    .idea
+    .expo
+    .expo-shared
+    .firebase
+
+    target
+    bin
+    obj
+
+    DerivedData
+)
+
+FIND_ARGS=( "(" )
+
+for p in "${PATTERNS[@]}"; do
+    FIND_ARGS+=( -name "$p" -o )
+done
+
+unset 'FIND_ARGS[${#FIND_ARGS[@]}-1]'
+
+FIND_ARGS+=( ")" )
+
+# -prune: don't descend into matched dirs, so junk nested inside other
+# junk (e.g. .cache inside node_modules) isn't listed or counted twice
+DIRS=()
+while IFS= read -r d; do
+    DIRS+=("$d")
+done < <(
+    find . "${FIND_ARGS[@]}" -type d -prune -print
+)
+
+if [[ ${#DIRS[@]} -eq 0 ]]; then
+    echo "✓ Nothing to clean"
+    exit 0
+fi
+
+TOTAL_KB=$( (du -sk "${DIRS[@]}" 2>/dev/null || true) | awk '{s+=$1} END {print s+0}')
+
+human() {
+    awk -v kb="$1" 'BEGIN {
+        if (kb >= 1073741824)    printf "%.2f TB", kb/1073741824
+        else if (kb >= 1048576)  printf "%.2f GB", kb/1048576
+        else if (kb >= 1024)     printf "%.2f MB", kb/1024
+        else                     printf "%d KB", kb
+    }'
+}
+
+echo
+echo "Found ${#DIRS[@]} junk directories"
+echo "Space reclaimable: $(human "$TOTAL_KB")"
+echo
+
+printf '%s\n' "${DIRS[@]}"
+
+echo
+read -rp "Delete all? [y/N] " ANS
+
+[[ "$ANS" =~ ^[Yy]$ ]] || exit 0
+
+for d in "${DIRS[@]}"; do
+    if [[ $VERBOSE -eq 1 ]]; then
+        echo "Deleting $d"
+    fi
+    rm -rf "$d"
+done
+
+echo
+printf "\033[32m✓ Reclaimed approximately %s\033[0m\n" "$(human "$TOTAL_KB")"

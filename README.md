@@ -4,11 +4,12 @@ A collection of useful bash scripts for productivity and automation. This reposi
 
 ## Scripts (scripts/)
 
-| Script  | Description                                 |
-| ------- | ------------------------------------------- |
-| ollaman | Interact with Ollama AI models via terminal |
-| openf   | Fuzzy open files/folders with default app   |
-| codef   | Fuzzy open files/folders in VS Code         |
+| Script    | Description                                                                      |
+| --------- | -------------------------------------------------------------------------------- |
+| ollaman   | Interact with Ollama AI models via terminal                                       |
+| openf     | Fuzzy open files/folders with default app                                         |
+| codef     | Fuzzy open files/folders in VS Code                                               |
+| cleanjunk | Find and delete build/dependency junk dirs with size preview and confirm prompt   |
 
 ## Configuration Files (conf/)
 
