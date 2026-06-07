@@ -3,50 +3,159 @@
 set -euo pipefail
 
 VERBOSE=0
+YES=0
+OLDER_DAYS=""
+EXCLUDES=()
 
-if [[ "${1:-}" == "--verbose" ]]; then
-    VERBOSE=1
+usage() {
+    cat <<'USAGE'
+cleanx - find and delete build/dependency junk directories
+
+Usage: cleanx [OPTIONS]
+
+Scans the current directory recursively for junk directories
+(node_modules, dist, build, caches, venvs, ...), shows the count,
+reclaimable size, a per-type breakdown and the largest offenders,
+then deletes them after confirmation.
+
+Options:
+  --verbose          list all directories (largest first) and print deletions
+  --yes, -y          skip the confirmation prompt
+  --exclude NAMES    skip directories by name; takes several names
+                     (space or comma separated) and is repeatable:
+                     --exclude foo bar  /  --exclude foo,bar
+  --older-than DAYS  only dirs not modified in the last DAYS days
+  --help, -h         show this help and exit
+
+Colors are disabled when output is piped or NO_COLOR is set.
+USAGE
+}
+
+die() {
+    echo "cleanx: $1" >&2
+    exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --verbose) VERBOSE=1 ;;
+        --yes|-y) YES=1 ;;
+        --exclude)
+            shift
+            [[ -n "${1:-}" ]] || die "--exclude needs a directory name"
+            # consume names until the next flag; each may be comma-separated
+            while [[ -n "${1:-}" && "${1:0:1}" != "-" ]]; do
+                OLD_IFS=$IFS
+                IFS=','
+                for part in $1; do
+                    [[ -n "$part" ]] && EXCLUDES+=("$part")
+                done
+                IFS=$OLD_IFS
+                shift
+            done
+            continue
+            ;;
+        --older-than)
+            shift
+            [[ "${1:-}" =~ ^[0-9]+$ ]] || die "--older-than needs a number of days"
+            OLDER_DAYS=$1
+            ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo "cleanx: unknown option: $1" >&2; usage >&2; exit 1 ;;
+    esac
+    shift
+done
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    BOLD=$'\033[1m' DIM=$'\033[2m' RED=$'\033[31m' GREEN=$'\033[32m'
+    YELLOW=$'\033[33m' CYAN=$'\033[36m' RESET=$'\033[0m'
+else
+    BOLD='' DIM='' RED='' GREEN='' YELLOW='' CYAN='' RESET=''
 fi
 
 PATTERNS=(
+    # js / web
     node_modules
+    bower_components
+    .next
+    .nuxt
+    .svelte-kit
+    .astro
+    .angular
+    .vite
+    .turbo
+    .parcel-cache
+    .cache
+    .eslintcache
+    .nyc_output
+    .jest-cache
+    .docusaurus
+    .sass-cache
+    storybook-static
+    coverage
+    dist
+    build
+    out
+
+    # serverless / deploy caches
+    .vercel
+    .netlify
+    .wrangler
+    .serverless
+    .aws-sam
+    .terraform
+    .terragrunt-cache
+    .firebase
+
+    # python
     venv
     .venv
     __pycache__
     .pytest_cache
     .mypy_cache
     .ruff_cache
+    .hypothesis
+    .ipynb_checkpoints
+    htmlcov
     .tox
     .nox
 
-    .next
-    .nuxt
-    .svelte-kit
-    .turbo
-    .parcel-cache
-    .cache
-    .eslintcache
-    coverage
-    dist
-    build
-    out
-
+    # mobile
     Pods
     .gradle
     .dart_tool
-    .idea
     .expo
     .expo-shared
-    .firebase
+    .cxx
+    .metro-cache
+    DerivedData
 
+    # compiled langs / build systems
     target
     bin
     obj
+    .build
+    _build
+    .stack-work
+    zig-out
+    .zig-cache
+    "cmake-build-*"
+    .ccache
+    .pio
 
-    DerivedData
+    # editors
+    .idea
 )
 
-FIND_ARGS=( "(" )
+FIND_ARGS=()
+
+if [[ ${#EXCLUDES[@]} -gt 0 ]]; then
+    for e in "${EXCLUDES[@]}"; do
+        FIND_ARGS+=( -name "$e" -prune -o )
+    done
+fi
+
+FIND_ARGS+=( "(" )
 
 for p in "${PATTERNS[@]}"; do
     FIND_ARGS+=( -name "$p" -o )
@@ -54,23 +163,59 @@ done
 
 unset 'FIND_ARGS[${#FIND_ARGS[@]}-1]'
 
-FIND_ARGS+=( ")" )
-
 # -prune: don't descend into matched dirs, so junk nested inside other
-# junk (e.g. .cache inside node_modules) isn't listed or counted twice
+# junk (e.g. .cache inside node_modules) isn't listed or counted twice.
+# -mtime (if any) comes after -prune so descent stops either way and
+# only the print is conditional.
+FIND_ARGS+=( ")" -type d -prune )
+
+if [[ -n "$OLDER_DAYS" ]]; then
+    FIND_ARGS+=( -mtime "+$OLDER_DAYS" )
+fi
+
+FIND_ARGS+=( -print0 )
+
+TMP_FIND=$(mktemp)
+TMP_DU=$(mktemp)
+trap 'rm -f "$TMP_FIND" "$TMP_DU"; if [[ -t 1 ]]; then tput cnorm 2>/dev/null || true; fi' EXIT
+
+FRAMES=( "⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏" )
+
+spinner() {
+    local pid=$1 msg=$2 i=0
+    if [[ ! -t 1 ]]; then
+        wait "$pid" 2>/dev/null || true
+        return
+    fi
+    tput civis 2>/dev/null || true
+    while kill -0 "$pid" 2>/dev/null; do
+        printf '\r%s%s%s %s' "$CYAN" "${FRAMES[$((i % ${#FRAMES[@]}))]}" "$RESET" "$msg"
+        i=$((i + 1))
+        sleep 0.08
+    done
+    printf '\r\033[K'
+    tput cnorm 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
+find . "${FIND_ARGS[@]}" > "$TMP_FIND" 2>/dev/null &
+spinner $! "Scanning for junk..."
+
 DIRS=()
-while IFS= read -r d; do
+while IFS= read -r -d '' d; do
     DIRS+=("$d")
-done < <(
-    find . "${FIND_ARGS[@]}" -type d -prune -print
-)
+done < "$TMP_FIND"
 
 if [[ ${#DIRS[@]} -eq 0 ]]; then
-    echo "✓ Nothing to clean"
+    echo "${GREEN}✓ Nothing to clean${RESET}"
     exit 0
 fi
 
-TOTAL_KB=$( (du -sk "${DIRS[@]}" 2>/dev/null || true) | awk '{s+=$1} END {print s+0}')
+# xargs -0 instead of one big argv: safe for thousands of dirs and spaces
+( xargs -0 du -sk < "$TMP_FIND" 2>/dev/null || true ) > "$TMP_DU" &
+spinner $! "Measuring ${#DIRS[@]} directories..."
+
+TOTAL_KB=$(awk '{s+=$1} END {print s+0}' "$TMP_DU")
 
 human() {
     awk -v kb="$1" 'BEGIN {
@@ -81,24 +226,74 @@ human() {
     }'
 }
 
+# shared awk helper: line-format "<kb> <path>" -> "<human size>  <path>"
+HUMAN_LINES='
+function human(kb) {
+    if (kb >= 1073741824)    return sprintf("%.2f TB", kb/1073741824)
+    else if (kb >= 1048576)  return sprintf("%.2f GB", kb/1048576)
+    else if (kb >= 1024)     return sprintf("%.2f MB", kb/1024)
+    return sprintf("%d KB", kb)
+}
+max > 0 && NR > max { next }
+{
+    kb = $1
+    line = $0
+    sub(/^[0-9]+[\t ]+/, "", line)
+    printf "  %s%9s%s  %s\n", dim, human(kb), reset, line
+}'
+
 echo
-echo "Found ${#DIRS[@]} junk directories"
-echo "Space reclaimable: $(human "$TOTAL_KB")"
+echo "Found ${BOLD}${CYAN}${#DIRS[@]}${RESET} junk directories"
+echo "Space reclaimable: ${BOLD}${YELLOW}$(human "$TOTAL_KB")${RESET}"
 echo
 
-printf '%s\n' "${DIRS[@]}"
-
+echo "${BOLD}By type:${RESET}"
+awk '
+{
+    kb = $1
+    line = $0
+    sub(/^[0-9]+[\t ]+/, "", line)
+    n = split(line, parts, "/")
+    name = parts[n]
+    cnt[name]++
+    size[name] += kb
+}
+END {
+    for (name in cnt) printf "%d\t%d\t%s\n", size[name], cnt[name], name
+}' "$TMP_DU" | sort -rn | awk -v dim="$DIM" -v reset="$RESET" '
+function human(kb) {
+    if (kb >= 1073741824)    return sprintf("%.2f TB", kb/1073741824)
+    else if (kb >= 1048576)  return sprintf("%.2f GB", kb/1048576)
+    else if (kb >= 1024)     return sprintf("%.2f MB", kb/1024)
+    return sprintf("%d KB", kb)
+}
+{ printf "  %-16s %s×%d%s %10s\n", $3, dim, $2, reset, human($1) }'
 echo
-read -rp "Delete all? [y/N] " ANS
 
-[[ "$ANS" =~ ^[Yy]$ ]] || exit 0
+if [[ $VERBOSE -eq 1 ]]; then
+    echo "${BOLD}All directories:${RESET}"
+    sort -rn "$TMP_DU" | awk -v dim="$DIM" -v reset="$RESET" -v max=0 "$HUMAN_LINES"
+    echo
+else
+    echo "${BOLD}Largest:${RESET}"
+    sort -rn "$TMP_DU" | awk -v dim="$DIM" -v reset="$RESET" -v max=5 "$HUMAN_LINES"
+    if [[ ${#DIRS[@]} -gt 5 ]]; then
+        echo "  ${DIM}... and $(( ${#DIRS[@]} - 5 )) more (--verbose to see all)${RESET}"
+    fi
+    echo
+fi
+
+if [[ $YES -eq 0 ]]; then
+    read -rp "${BOLD}${RED}Delete all?${RESET} [y/N] " ANS || ANS=""
+    [[ "$ANS" =~ ^[Yy]$ ]] || exit 0
+fi
 
 for d in "${DIRS[@]}"; do
     if [[ $VERBOSE -eq 1 ]]; then
-        echo "Deleting $d"
+        echo "${DIM}Deleting $d${RESET}"
     fi
     rm -rf "$d"
 done
 
 echo
-printf "\033[32m✓ Reclaimed approximately %s\033[0m\n" "$(human "$TOTAL_KB")"
+echo "${GREEN}${BOLD}✓ Reclaimed approximately $(human "$TOTAL_KB")${RESET}"
