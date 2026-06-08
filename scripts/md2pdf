@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# md2pdf - Markdown to PDF with robust wrapping + a simple interactive TUI.
+#
+# Usage:
+#   md2pdf                      interactive: pick file, set options in a menu, render
+#   md2pdf input.md [out.pdf]   non-interactive
+#   md2pdf in.md --font "Times New Roman" --orientation landscape --margin 2cm -o out.pdf
+#
+# Wrapping (nothing runs off the page): a Lua filter forces tables into wrapping
+# columns and makes inline `code` + long path/url tokens breakable; fvextra wraps
+# fenced code blocks. Engine: pandoc + tectonic.
+#
+# No in-terminal page preview (it raced tectonic's cache and was blurry anyway).
+# To see the result, open the finished PDF: `open file.pdf`.
+#
+# Deps: pandoc, tectonic (required). fzf, gum (interactive menu).
+set -uo pipefail
+
+write_assets() {
+  local d="$1"
+  cat > "$d/hdr.tex" <<'TEX'
+\usepackage{longtable,booktabs,array}
+\usepackage{ragged2e}
+\usepackage{seqsplit}
+\usepackage{fvextra}
+\fvset{breaklines=true,breakanywhere=true,breaksymbolleft={},breaksymbolright={}}
+\RecustomVerbatimEnvironment{verbatim}{Verbatim}{breaklines,breakanywhere,breaksymbolleft={},breaksymbolright={}}
+\usepackage{etoolbox}
+\apptocmd{\sloppy}{\hbadness=10000\relax}{}{}
+\setlength{\LTleft}{0pt}\setlength{\LTright}{0pt}
+\sloppy
+TEX
+  cat > "$d/wrap.lua" <<'LUA'
+local function lesc(s)
+  local m = {['\\']='\\textbackslash{}',['{']='\\{',['}']='\\}',['$']='\\$',
+             ['%']='\\%',['&']='\\&',['#']='\\#',['_']='\\_',
+             ['^']='\\textasciicircum{}',['~']='\\textasciitilde{}'}
+  return (s:gsub('[\\{}%$%%&#_%^~]', function(c) return m[c] end))
+end
+function Code(el)
+  return pandoc.RawInline('latex', '\\texttt{\\seqsplit{' .. lesc(el.text) .. '}}')
+end
+function Str(el)
+  local t = el.text
+  if #t >= 24 and t:find('[/:_]') then
+    return pandoc.RawInline('latex', (lesc(t):gsub('([/:_%-])', '%1\\allowbreak{}')))
+  end
+end
+function Table(t)
+  local cs = t.colspecs ; local n = #cs
+  for i = 1, n do cs[i] = { cs[i][1], 1.0 / n } end
+  return t
+end
+LUA
+}
+
+pandoc_render() { # <in> <out> <font> <orient> <margin> <fsize> <assets> <toc>  (MD2PDF_CACHED=1 => offline)
+  local src="$1" out="$2" font="$3" orient="$4" margin="$5" fsize="$6" d="$7" toc="$8"
+  local args=(--pdf-engine=tectonic --lua-filter="$d/wrap.lua" -H "$d/hdr.tex"
+    -V geometry:margin="$margin" -V fontsize="$fsize"
+    -V colorlinks=true -V linkcolor=blue -V urlcolor=blue -V documentclass=article)
+  [ "${MD2PDF_CACHED:-0}" = 1 ] && args+=(--pdf-engine-opt=--only-cached)
+  [ "$orient" = landscape ] && args+=(-V geometry:landscape)
+  [ "$font" != Default ] && args+=(-V mainfont="$font")
+  [ "$toc" = 1 ] && args+=(--toc "--toc-depth=${TOCDEPTH:-2}")
+  pandoc "$src" -o "$out" "${args[@]}" 2> "$d/log"
+}
+
+if [ "${1:-}" = "__render" ]; then
+  shift; A="$(mktemp -d)"; write_assets "$A"
+  if MD2PDF_CACHED=1 pandoc_render "$1" "$2" "$3" "$4" "$5" "$6" "$A" 1; then rm -rf "$A"; exit 0; fi
+  printf 'md2pdf: cached render failed, trying online (needs network) …\n' >&2
+  if pandoc_render "$1" "$2" "$3" "$4" "$5" "$6" "$A" 1; then rm -rf "$A"; exit 0
+  else grep -i error "$A/log" | grep -vi 'overfull\|underfull' | head -6 >&2; rm -rf "$A"; exit 1; fi
+fi
+
+err() { printf 'md2pdf: %s\n' "$*" >&2; }
+command -v pandoc   >/dev/null 2>&1 || { err "pandoc not found (brew install pandoc)"; exit 3; }
+command -v tectonic >/dev/null 2>&1 || { err "tectonic not found (brew install tectonic)"; exit 3; }
+
+SRC="" OUT="" FONT="Default" ORIENT="portrait" MARGIN="1.6cm" FSIZE="${FONTSIZE:-9pt}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --font) FONT="$2"; shift 2;; --orientation) ORIENT="$2"; shift 2;;
+    --margin) MARGIN="$2"; shift 2;; --fontsize) FSIZE="$2"; shift 2;;
+    -o) OUT="$2"; shift 2;;
+    -*) err "unknown flag: $1"; exit 2;;
+    *) if [ -z "$SRC" ]; then SRC="$1"; elif [ -z "$OUT" ]; then OUT="$1"; fi; shift;;
+  esac
+done
+
+font_list() {
+  printf 'Default\n'
+  if command -v fc-list >/dev/null 2>&1; then
+    fc-list : family 2>/dev/null | sed 's/,.*//; s/^ *//; s/ *$//' | LC_ALL=C grep -E '^[A-Za-z]' | sort -u
+  else printf '%s\n' 'Helvetica Neue' 'Times New Roman' Georgia Palatino Charter 'Avenir Next'; fi
+}
+self_path() { command -v md2pdf 2>/dev/null || printf '%s' "$0"; }
+menu() { if command -v gum >/dev/null 2>&1; then gum choose "$@"; else fzf --no-sort; fi; }
+
+if [ -z "$SRC" ]; then
+  command -v fzf >/dev/null 2>&1 || { err "fzf not found (brew install fzf)"; exit 3; }
+  fprev='command -v glow >/dev/null 2>&1 && glow -s dark {} 2>/dev/null || head -60 {}'
+  SRC="$(find . -type f \( -name '*.md' -o -name '*.markdown' \) -not -path '*/.git/*' 2>/dev/null \
+        | sed 's|^\./||' | fzf --prompt='pick markdown > ' --height=90% --border --preview "$fprev" --preview-window=right:55%)"
+  [ -n "$SRC" ] || { err "cancelled"; exit 0; }
+  OUT="${SRC%.*}.pdf"   # default: save the PDF right beside the source .md
+
+  last="font:"   # remember which row to put the cursor on when we re-open the menu
+  while true; do
+    rows=( "font:        $FONT" "orientation: $ORIENT" "margin:      $MARGIN" \
+           "fontsize:    $FSIZE" "output:      $OUT" "▶  Render" )
+    presel=""; pos=1; i=1
+    for row in "${rows[@]}"; do case "$row" in "$last"*) presel="$row"; pos=$i;; esac; i=$((i+1)); done
+    if command -v gum >/dev/null 2>&1; then
+      sel="$(printf '%s\n' "${rows[@]}" | gum choose ${presel:+--selected "$presel"} --header "edit a field, or Render   ·   $SRC")"
+    else
+      sel="$(printf '%s\n' "${rows[@]}" | fzf --no-sort --height=40% --border --bind "start:pos($pos)" --header "edit / render · $SRC")"
+    fi
+    [ -n "$sel" ] || { err "cancelled"; exit 0; }
+    case "$sel" in
+      font:*)        last="font:";        r="$(font_list | fzf --prompt='font (type to filter) > ' --height=90% --border)"; [ -n "$r" ] && FONT="$r";;
+      orientation:*) last="orientation:"; r="$(printf 'portrait\nlandscape\n' | menu --header orientation)"; [ -n "$r" ] && ORIENT="$r";;
+      margin:*)      last="margin:";      r="$(printf '1.6cm\n1.2cm\n2cm\n2.5cm\n3cm\n' | menu --header margin)"; [ -n "$r" ] && MARGIN="$r";;
+      fontsize:*)    last="fontsize:";    r="$(printf '9pt\n10pt\n11pt\n8pt\n12pt\n' | menu --header 'font size')"; [ -n "$r" ] && FSIZE="$r";;
+      output:*)      last="output:";      if command -v gum >/dev/null 2>&1; then r="$(gum input --prompt 'output > ' --value "$OUT")"; else read -e -r -p "output [$OUT]: " r; fi; [ -n "$r" ] && OUT="$r";;
+      "▶  Render")   break;;
+    esac
+  done
+  [ "${OUT%.pdf}" = "$OUT" ] && OUT="$OUT.pdf"          # auto-add .pdf (type "nihesh", get nihesh.pdf)
+  case "$OUT" in */*) ;; *) OUT="$(dirname "$SRC")/$OUT";; esac  # bare name -> save beside the source
+else
+  [ -f "$SRC" ] || { err "no such file: $SRC"; exit 2; }
+  [ -n "$OUT" ] || OUT="${SRC%.*}.pdf"
+fi
+
+SELF="$(self_path)"
+if command -v gum >/dev/null 2>&1; then
+  gum spin --spinner dot --title "rendering $OUT …" --show-error -- \
+    "$SELF" __render "$SRC" "$OUT" "$FONT" "$ORIENT" "$MARGIN" "$FSIZE"; rc=$?
+else
+  printf 'md2pdf: rendering → %s …\n' "$OUT"
+  "$SELF" __render "$SRC" "$OUT" "$FONT" "$ORIENT" "$MARGIN" "$FSIZE"; rc=$?
+fi
+if [ "$rc" -eq 0 ] && [ -f "$OUT" ]; then printf '✓ wrote %s  (%s · %s · margin %s · %s)\n' "$OUT" "$FONT" "$ORIENT" "$MARGIN" "$FSIZE"
+else err "render failed (exit $rc) — nothing written"; exit 1; fi

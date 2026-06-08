@@ -10,6 +10,7 @@ A collection of useful bash scripts for productivity and automation. This reposi
 | openf     | Fuzzy open files/folders with default app                                         |
 | codef     | Fuzzy open files/folders in VS Code                                               |
 | cleanx    | Find and delete build/dependency junk dirs with size preview and confirm prompt   |
+| md2pdf    | Markdown to PDF (pandoc + tectonic) with auto-wrapping (tables, code, long paths); interactive fzf/gum TUI for font, orientation, margin |
 
 ## Configuration Files (conf/)
 
